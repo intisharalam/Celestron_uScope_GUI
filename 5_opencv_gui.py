@@ -63,7 +63,7 @@ PAN_STEP = 0.05
 # shrink. This only affects what's DISPLAYED -- snapshots are still saved
 # at the full captured resolution (see take snapshot below, which saves
 # `view`, not the resized `displayed`).
-DISPLAY_WIDTH = 1280  # comfortably fits on a 1920x1080 screen with room
+DISPLAY_WIDTH = 800  # comfortably fits on a 1920x1080 screen with room
                        # for the taskbar/other windows
 
 # Text overlay appearance

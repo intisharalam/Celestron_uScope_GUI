@@ -1,0 +1,346 @@
+"""
+microscope_viewer.py
+
+This is your original merged viewer (camera open, zoom/pan, FPS measurement,
+the 3 real resolution tiers, snapshot) PLUS one new feature:
+
+  STACKED CAPTURE (key: 'k')
+  ---------------------------
+  Single frames from this sensor are noisy -- you can see it in the grainy
+  texture on flat/featureless areas. That noise is RANDOM from frame to
+  frame, while the real specimen detail is NOT -- it's the same every frame.
+  So if we capture N frames of a STATIONARY specimen and average them
+  together, the random noise partially cancels out (it shrinks roughly by
+  sqrt(N)), while the real signal stays exactly as strong. The result is a
+  genuinely cleaner image with real detail more visible -- this is not
+  upscaling and not fabricating anything; it's recovering signal that was
+  already there but buried under noise.
+
+  After averaging, we apply unsharp masking to the CLEAN averaged image.
+  Sharpening a single noisy frame mostly just amplifies the noise -- but
+  sharpening an already-denoised average is safe and makes real edges in
+  the specimen look crisper, because there's real signal there to sharpen.
+
+  Practical requirement: the specimen and microscope must both be
+  COMPLETELY STILL during the ~1-3 seconds it takes to grab all the frames,
+  or stacking will blur things instead of sharpening them (motion between
+  frames doesn't average out cleanly the way noise does). Use the stand,
+  not handheld, for this mode.
+
+Controls (also drawn on-screen, bottom-left of the window):
+  q        quit
+  +/-      zoom in/out
+  0        reset zoom and pan
+  w/a/s/d  pan around while zoomed in
+  1        resolution: Fast    (800x600,   ~28 fps)
+  2        resolution: Balanced (1280x960,  ~24 fps)
+  3        resolution: Max detail (2048x1536, ~14 fps)
+  p        save a snapshot (PNG) of exactly what's on screen, single frame
+  k        STACKED capture -- hold specimen still, captures N frames,
+           averages + sharpens them, saves the result (takes a few seconds)
+"""
+
+import cv2
+import numpy as np
+import os
+import time
+from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SAVE_DIR = os.path.join(SCRIPT_DIR, "img")
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+RESOLUTIONS = {
+    ord('1'): ("Fast",       800, 600),
+    ord('2'): ("Balanced",   1280, 960),
+    ord('3'): ("Max detail", 2048, 1536),
+}
+
+ZOOM_MIN = 1.0
+ZOOM_MAX = 8.0
+ZOOM_STEP = 0.5
+PAN_STEP = 0.05
+
+DISPLAY_WIDTH = 960
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+TEXT_COLOR = (0, 255, 0)
+TEXT_SCALE = 0.55
+TEXT_THICKNESS = 1
+LINE_HEIGHT = 22
+
+CONTROLS_TEXT = [
+    "q quit | +/- zoom | 0 reset | wasd pan | 1/2/3 res | p snapshot | k STACK capture",
+]
+
+# --- Stacking settings -----------------------------------------------------
+# How many frames to average. More frames = more noise reduction (sqrt(N)
+# improvement) but takes longer and demands more stillness. 16 is a solid
+# default: cuts noise ~4x, takes well under a second of real capture time
+# at this camera's frame rates.
+STACK_FRAME_COUNT = 16
+
+# Unsharp mask strength applied AFTER averaging. This is standard
+# "sharpen the blurred-out edges" processing, applied to the now-clean
+# averaged image -- safe here specifically because the input is already
+# denoised. amount=1.5 is a moderate, not-overcooked sharpen; raise toward
+# 2.0-2.5 for more bite if specimens still look soft, but watch for halos
+# (bright/dark fringes around edges) as a sign you've gone too far.
+SHARPEN_AMOUNT = 1.5
+SHARPEN_RADIUS = 2  # gaussian blur radius used to build the unsharp mask
+
+
+def resize_to_width(frame, width):
+    h, w = frame.shape[:2]
+    scale = width / w
+    new_size = (width, int(h * scale))
+    return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+
+
+def draw_text_lines(frame, lines, anchor="top-left"):
+    h, w = frame.shape[:2]
+    margin = 10
+    for i, line in enumerate(lines):
+        (text_w, text_h), _ = cv2.getTextSize(line, FONT, TEXT_SCALE, TEXT_THICKNESS)
+        if anchor == "top-left":
+            x = margin
+            y = margin + text_h + i * LINE_HEIGHT
+        elif anchor == "bottom-left":
+            x = margin
+            y = h - margin - (len(lines) - 1 - i) * LINE_HEIGHT
+        else:
+            raise ValueError(f"Unknown anchor: {anchor}")
+        cv2.rectangle(frame, (x - 4, y - text_h - 4), (x + text_w + 4, y + 4),
+                      (0, 0, 0), thickness=-1)
+        cv2.putText(frame, line, (x, y), FONT, TEXT_SCALE,
+                    TEXT_COLOR, TEXT_THICKNESS, cv2.LINE_AA)
+
+
+def apply_zoom_pan(frame, zoom, pan_x, pan_y):
+    if zoom <= 1.0:
+        return frame
+    h, w = frame.shape[:2]
+    crop_w = w / zoom
+    crop_h = h / zoom
+    cx = pan_x * w
+    cy = pan_y * h
+    x0 = int(max(0, min(w - crop_w, cx - crop_w / 2)))
+    y0 = int(max(0, min(h - crop_h, cy - crop_h / 2)))
+    x1 = int(x0 + crop_w)
+    y1 = int(y0 + crop_h)
+    cropped = frame[y0:y1, x0:x1]
+    return cv2.resize(cropped, (w, h))
+
+
+# ---------------------------------------------------------------------------
+# Stacking + sharpening -- the new, real-detail-recovery feature
+# ---------------------------------------------------------------------------
+
+def capture_stack(cap, n_frames, display_callback=None):
+    """Grab n_frames frames in quick succession and average them.
+
+    Averaging (not median, not max) is correct here: we want to cancel
+    RANDOM sensor noise, and the mean is the statistically optimal way to
+    do that for noise that's symmetric around the true value (which sensor
+    read noise typically is). We accumulate in float64 to avoid rounding
+    error from repeatedly adding 8-bit values.
+
+    display_callback(i, n_frames), if given, is called between captures so
+    the caller can update an on-screen "capturing frame i/n" message --
+    otherwise this loop would make the app look frozen for the ~1 second
+    or so it takes to grab all the frames.
+    """
+    accumulator = None
+    captured = 0
+
+    for i in range(n_frames):
+        ok, frame = cap.read()
+        if not ok:
+            continue  # skip dropped frames rather than poison the average
+        frame_f = frame.astype(np.float64)
+        if accumulator is None:
+            accumulator = frame_f
+        else:
+            accumulator += frame_f
+        captured += 1
+        if display_callback:
+            display_callback(i + 1, n_frames)
+
+    if captured == 0:
+        return None
+
+    averaged = (accumulator / captured)
+    return np.clip(averaged, 0, 255).astype(np.uint8)
+
+
+def unsharp_mask(image, amount, radius):
+    """Classic unsharp mask: blur the image, subtract the blur from the
+    original to isolate edges/fine detail, then add that back in at extra
+    strength. This is safe and effective specifically on a low-noise input
+    (like our averaged stack) -- on a noisy single frame it would mostly
+    just make the noise grain itself look more pronounced.
+    """
+    blurred = cv2.GaussianBlur(image, (0, 0), radius)
+    sharpened = cv2.addWeighted(image, 1 + amount, blurred, -amount, 0)
+    return sharpened
+
+
+def show_capturing_message(progress_text):
+    """Immediate placeholder so the app doesn't look frozen during a stack
+    capture -- same idea as the resolution-switch placeholder."""
+    placeholder = np.zeros((480, DISPLAY_WIDTH, 3), dtype="uint8")
+    (text_w, text_h), _ = cv2.getTextSize(progress_text, FONT, 1.0, 2)
+    x = (DISPLAY_WIDTH - text_w) // 2
+    y = (480 + text_h) // 2
+    cv2.putText(placeholder, progress_text, (x, y), FONT, 1.0,
+                TEXT_COLOR, 2, cv2.LINE_AA)
+    cv2.putText(placeholder, "Keep the specimen and scope still!",
+                (20, 460), FONT, 0.6, (0, 165, 255), 1, cv2.LINE_AA)
+    cv2.imshow("Microscope Viewer", placeholder)
+    cv2.waitKey(1)
+
+
+# ---------------------------------------------------------------------------
+# Camera setup
+# ---------------------------------------------------------------------------
+
+CAMERA_INDEX = 1
+
+def open_camera_at(res_key):
+    _, width, height = RESOLUTIONS[res_key]
+    new_cap = cv2.VideoCapture(CAMERA_INDEX)
+    new_cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    new_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    return new_cap, width, height
+
+
+def show_switching_message(width, height):
+    placeholder = np.zeros((480, DISPLAY_WIDTH, 3), dtype="uint8")
+    msg = f"Switching to {width}x{height}..."
+    (text_w, text_h), _ = cv2.getTextSize(msg, FONT, 1.0, 2)
+    x = (DISPLAY_WIDTH - text_w) // 2
+    y = (480 + text_h) // 2
+    cv2.putText(placeholder, msg, (x, y), FONT, 1.0, TEXT_COLOR, 2, cv2.LINE_AA)
+    cv2.imshow("Microscope Viewer", placeholder)
+    cv2.waitKey(1)
+
+
+current_res_key = ord('3')  # default to Max detail since that's what you'd
+                             # want for stacking anyway
+cap, w, h = open_camera_at(current_res_key)
+
+if not cap.isOpened():
+    print("Could not open the camera. Check the USB connection and that")
+    print("no other program (e.g. Celestron's own software) is using it.")
+    raise SystemExit(1)
+
+zoom = ZOOM_MIN
+pan_x, pan_y = 0.5, 0.5
+
+frame_count = 0
+fps_clock = time.time()
+measured_fps = 0.0
+
+print("Controls: q=quit  +/-=zoom  0=reset  wasd=pan  1/2/3=resolution  "
+      "p=snapshot  k=STACK capture")
+print(f"Saving images to: {SAVE_DIR}")
+print(f"Stack capture uses {STACK_FRAME_COUNT} frames averaged together.")
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        continue
+
+    frame_count += 1
+    now = time.time()
+    if now - fps_clock >= 1.0:
+        measured_fps = frame_count / (now - fps_clock)
+        frame_count = 0
+        fps_clock = now
+
+    view = apply_zoom_pan(frame, zoom, pan_x, pan_y)
+    displayed = resize_to_width(view, DISPLAY_WIDTH)
+
+    res_name, _, _ = RESOLUTIONS[current_res_key]
+    status_line = f"{measured_fps:4.1f} fps   {w}x{h} ({res_name})   zoom {zoom:.1f}x"
+    draw_text_lines(displayed, [status_line], anchor="top-left")
+    draw_text_lines(displayed, CONTROLS_TEXT, anchor="bottom-left")
+
+    cv2.imshow("Microscope Viewer", displayed)
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord('q'):
+        break
+
+    elif key in (ord('+'), ord('=')):
+        zoom = min(ZOOM_MAX, zoom + ZOOM_STEP)
+
+    elif key == ord('-'):
+        zoom = max(ZOOM_MIN, zoom - ZOOM_STEP)
+
+    elif key == ord('0'):
+        zoom = ZOOM_MIN
+        pan_x, pan_y = 0.5, 0.5
+
+    elif key == ord('w'):
+        pan_y = max(0.0, pan_y - PAN_STEP)
+    elif key == ord('s'):
+        pan_y = min(1.0, pan_y + PAN_STEP)
+    elif key == ord('a'):
+        pan_x = max(0.0, pan_x - PAN_STEP)
+    elif key == ord('d'):
+        pan_x = min(1.0, pan_x + PAN_STEP)
+
+    elif key in RESOLUTIONS and key != current_res_key:
+        current_res_key = key
+        _, new_w, new_h = RESOLUTIONS[current_res_key]
+        show_switching_message(new_w, new_h)
+        cap.release()
+        cap, w, h = open_camera_at(current_res_key)
+        frame_count = 0
+        fps_clock = time.time()
+
+    elif key == ord('p'):
+        # Single-frame snapshot, unchanged from before: full sensor
+        # resolution, raw (pre-zoom/pan) frame, no processing applied.
+        filename = datetime.now().strftime("snapshot_%Y%m%d_%H%M%S.png")
+        path = os.path.join(SAVE_DIR, filename)
+        cv2.imwrite(path, frame)
+        print(f"Saved single-frame snapshot ({w}x{h}):", path)
+
+    elif key == ord('k'):
+        # New: stacked capture for real noise reduction + safe sharpening.
+        def progress(i, n):
+            show_capturing_message(f"Stacking frame {i}/{n}...")
+
+        averaged = capture_stack(cap, STACK_FRAME_COUNT, display_callback=progress)
+
+        if averaged is None:
+            print("Stack capture failed -- no frames were read.")
+        else:
+            sharpened = unsharp_mask(averaged, SHARPEN_AMOUNT, SHARPEN_RADIUS)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            raw_path = os.path.join(SAVE_DIR, f"stacked_{timestamp}_raw.png")
+            sharp_path = os.path.join(SAVE_DIR, f"stacked_{timestamp}_sharpened.png")
+
+            # Save BOTH versions: the plain averaged stack (denoised, no
+            # sharpening) and the sharpened version. Keeping the
+            # unsharpened one gives you an honest fallback to compare
+            # against, in case the sharpening amount needs tuning for a
+            # particular specimen.
+            cv2.imwrite(raw_path, averaged)
+            cv2.imwrite(sharp_path, sharpened)
+
+            print(f"Saved stacked capture ({STACK_FRAME_COUNT} frames, "
+                  f"{w}x{h}):")
+            print(f"  denoised (no sharpen): {raw_path}")
+            print(f"  denoised + sharpened : {sharp_path}")
+
+cap.release()
+cv2.destroyAllWindows()
