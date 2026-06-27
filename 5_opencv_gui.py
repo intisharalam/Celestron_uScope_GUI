@@ -1,26 +1,25 @@
-"""
-This merges everything from scripts 1-4 into one working app:
-  1_camera_test.py        -> opening the camera
-  2_zoom_pan.py            -> apply_zoom_pan() function (unchanged)
-  3_fps_and_capture_mode.py -> measuring real FPS
-  4_resolution_probe.py    -> the 3 real resolution tiers this camera supports
-
-Controls (also drawn on-screen, bottom-left of the window):
-  q        quit
-  +/-      zoom in/out
-  0        reset zoom and pan
-  w/a/s/d  pan around while zoomed in
-  1        resolution: Fast    (800x600,   ~28 fps)
-  2        resolution: Balanced (1280x960,  ~24 fps)
-  3        resolution: Max detail (2048x1536, ~14 fps)
-  p        save a snapshot (PNG) of exactly what's on screen
-
-NOTE on resolution switching speed: pressing 1/2/3 closes and reopens the
-camera connection (see open_camera_at() below for why). That reconnect
-takes a real moment -- there's no way to make the USB renegotiation itself
-instant -- but we show a "Switching..." message immediately so it's clear
-the app hasn't frozen while that happens.
-"""
+# Microscope viewer app
+# This combines all the stuff I learned from my first 4 test scripts:
+#   1_camera_test.py
+#   2_zoom_pan.py
+#   3_fps_and_capture_mode.py
+#   4_resolution_probe.py
+#
+# Controls:
+#   q = quit
+#   + = zoom in
+#   - = zoom out
+#   0 = reset zoom/pan back to normal
+#   w/a/s/d = move around when zoomed in
+#   1 = low res (800x600, faster, about 28 fps)
+#   2 = medium res (1280x960, about 24 fps)
+#   3 = high res (2048x1536, slower, about 14 fps)
+#   p = take a picture and save it
+#
+# Note: when you press 1/2/3 it takes a second to switch because the
+# camera has to disconnect and reconnect at the new resolution. I put a
+# "Switching..." message on screen so it doesn't look frozen while that
+# happens.
 
 import cv2
 import numpy as np
@@ -28,106 +27,66 @@ import os
 import time
 from datetime import datetime
 
-# ---------------------------------------------------------------------------
-# Settings
-# ---------------------------------------------------------------------------
+# where to save snapshots
+folder_path = os.path.dirname(os.path.abspath(__file__))
+save_folder = os.path.join(folder_path, "img")
+if not os.path.exists(save_folder):
+    os.makedirs(save_folder)
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SAVE_DIR = os.path.join(SCRIPT_DIR, "img")
-os.makedirs(SAVE_DIR, exist_ok=True)
+# which camera to use, change this number if it opens the wrong camera
+camera_index = 1
 
-# The 3 real resolution tiers found by 4_resolution_probe.py.
-# Key = the number key that selects it.
-#
-# NOTE: this camera does NOT keep the same field of view across tiers.
-# Higher resolutions read out a smaller, more central region of the sensor,
-# so "Max detail" looks more zoomed-in than "Fast"/"Balanced" even at
-# zoom=1.0x. This is a hardware/firmware behavior, not a bug -- there's
-# nothing wrong with apply_zoom_pan() or resize_to_width() below. If you
-# want the same framing across tiers, physically move the scope further
-# from the subject when using "Max detail".
-RESOLUTIONS = {
-    ord('1'): ("Fast",       800, 600),
-    ord('2'): ("Balanced",   1280, 960),
-    ord('3'): ("Max detail", 2048, 1536),
-}
+# how much to zoom in/out each time you press + or -
+zoom_min = 1.0
+zoom_max = 8.0
+zoom_step = 0.5
 
-ZOOM_MIN = 1.0
-ZOOM_MAX = 8.0
-ZOOM_STEP = 0.5
-PAN_STEP = 0.05
+# how far to move when panning with wasd
+pan_step = 0.05
 
-# The on-screen window is always resized to exactly this width, no matter
-# what capture resolution is selected -- this keeps every tier the same
-# window size so switching tiers doesn't make the window visibly grow or
-# shrink. This only affects what's DISPLAYED -- snapshots are still saved
-# at the full captured resolution (see take snapshot below, which saves
-# `view`, not the resized `displayed`).
-DISPLAY_WIDTH = 800  # comfortably fits on a 1920x1080 screen with room
-                       # for the taskbar/other windows
+# the window will always be this wide so it doesn't change size when
+# you switch resolutions
+window_width = 800
 
-# Text overlay appearance
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-TEXT_COLOR = (0, 255, 0)
-TEXT_SCALE = 0.55
-TEXT_THICKNESS = 1
-LINE_HEIGHT = 22  # vertical spacing between stacked lines of text
-
-CONTROLS_TEXT = [
-    "q quit | +/- zoom | 0 reset | wasd pan | 1/2/3 resolution | p snapshot",
-]
+# text settings for writing on screen
+font = cv2.FONT_HERSHEY_SIMPLEX
+text_color = (0, 255, 0)
+text_size = 0.55
+text_thickness = 1
+line_gap = 22  # space between lines of text
 
 
-def resize_to_width(frame, width):
-    """Scale a frame to exactly `width` pixels wide, keeping aspect ratio.
-    Unlike a 'max width' cap, this ALWAYS resizes -- so every tier ends up
-    the same on-screen size, instead of smaller captures just staying small."""
-    h, w = frame.shape[:2]
+def resize_to_width(img, width):
+    # makes the image exactly "width" pixels wide and keeps it from
+    # looking stretched
+    h, w = img.shape[:2]
     scale = width / w
-    new_size = (width, int(h * scale))
-    return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+    new_w = width
+    new_h = int(h * scale)
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
-def draw_text_lines(frame, lines, anchor="top-left"):
-    """Draw a stack of text lines onto a frame, anchored to a screen corner.
-
-    Each line gets a dark semi-transparent backing rectangle behind it so
-    the text stays readable regardless of what's in the live image behind
-    it (plain green text on a plain bright background would otherwise be
-    hard to read).
-    """
-    h, w = frame.shape[:2]
-    margin = 10
-
-    for i, line in enumerate(lines):
-        (text_w, text_h), _ = cv2.getTextSize(line, FONT, TEXT_SCALE, TEXT_THICKNESS)
-
-        if anchor == "top-left":
-            x = margin
-            y = margin + text_h + i * LINE_HEIGHT
-        elif anchor == "bottom-left":
-            x = margin
-            y = h - margin - (len(lines) - 1 - i) * LINE_HEIGHT
-        else:
-            raise ValueError(f"Unknown anchor: {anchor}")
-
-        # backing rectangle, slightly larger than the text itself
-        cv2.rectangle(frame,
-                      (x - 4, y - text_h - 4),
-                      (x + text_w + 4, y + 4),
-                      (0, 0, 0), thickness=-1)
-
-        cv2.putText(frame, line, (x, y), FONT, TEXT_SCALE,
-                    TEXT_COLOR, TEXT_THICKNESS, cv2.LINE_AA)
+def put_text_top_left(img, text):
+    # draws a black box behind the text so you can read it no matter
+    # what's behind it
+    (text_w, text_h), _ = cv2.getTextSize(text, font, text_size, text_thickness)
+    x = 10
+    y = 10 + text_h
+    cv2.rectangle(img, (x - 4, y - text_h - 4), (x + text_w + 4, y + 4), (0, 0, 0), -1)
+    cv2.putText(img, text, (x, y), font, text_size, text_color, text_thickness, cv2.LINE_AA)
 
 
-# ---------------------------------------------------------------------------
-# Zoom / pan -- straight from 2_zoom_pan.py, unchanged
-# ---------------------------------------------------------------------------
+def put_text_bottom_left(img, text):
+    h, w = img.shape[:2]
+    (text_w, text_h), _ = cv2.getTextSize(text, font, text_size, text_thickness)
+    x = 10
+    y = h - 10
+    cv2.rectangle(img, (x - 4, y - text_h - 4), (x + text_w + 4, y + 4), (0, 0, 0), -1)
+    cv2.putText(img, text, (x, y), font, text_size, text_color, text_thickness, cv2.LINE_AA)
 
+
+# this is copied from 2_zoom_pan.py, did not change it
 def apply_zoom_pan(frame, zoom, pan_x, pan_y):
-    """Crop the frame around (pan_x, pan_y) at the given zoom level, then
-    resize back up to full size so nothing downstream needs to know about zoom."""
     if zoom <= 1.0:
         return frame
 
@@ -135,163 +94,194 @@ def apply_zoom_pan(frame, zoom, pan_x, pan_y):
     crop_w = w / zoom
     crop_h = h / zoom
 
-    cx = pan_x * w
-    cy = pan_y * h
+    center_x = pan_x * w
+    center_y = pan_y * h
 
-    x0 = int(max(0, min(w - crop_w, cx - crop_w / 2)))
-    y0 = int(max(0, min(h - crop_h, cy - crop_h / 2)))
+    x0 = center_x - crop_w / 2
+    y0 = center_y - crop_h / 2
+
+    # don't let it go off the edge of the image
+    if x0 < 0:
+        x0 = 0
+    if y0 < 0:
+        y0 = 0
+    if x0 > w - crop_w:
+        x0 = w - crop_w
+    if y0 > h - crop_h:
+        y0 = h - crop_h
+
+    x0 = int(x0)
+    y0 = int(y0)
     x1 = int(x0 + crop_w)
     y1 = int(y0 + crop_h)
 
     cropped = frame[y0:y1, x0:x1]
-    return cv2.resize(cropped, (w, h))
+    resized_back = cv2.resize(cropped, (w, h))
+    return resized_back
 
 
-# ---------------------------------------------------------------------------
-# Camera setup
-# ---------------------------------------------------------------------------
-
-CAMERA_INDEX = 1  # change this if your microscope shows up at a different index
-
-def open_camera_at(res_key):
-    """(Re)open the camera fresh at the given resolution.
-
-    Why reopen instead of just calling cap.set() on the running camera?
-    On this camera + the MSMF backend, changing resolution on a live
-    stream corrupts the next frame and crashes. Releasing the camera and
-    opening it again at the new resolution avoids that entirely -- it's
-    a bit slower (a short reconnect pause) but reliable.
-    """
-    _, width, height = RESOLUTIONS[res_key]
-    new_cap = cv2.VideoCapture(CAMERA_INDEX)
+def open_camera(width, height):
+    # I have to fully close and reopen the camera to change resolution,
+    # because just calling cap.set() on a running camera crashes on my
+    # setup (something to do with the MSMF backend). Closing and
+    # reopening fresh is slower but it doesn't crash.
+    new_cap = cv2.VideoCapture(camera_index)
     new_cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     new_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    return new_cap, width, height
+    return new_cap
 
 
-def show_switching_message(width, height):
-    """Display an immediate placeholder frame so the app doesn't look
-    frozen during the reconnect pause when changing resolution."""
-    placeholder = np.zeros((480, DISPLAY_WIDTH, 3), dtype="uint8")
-    msg = f"Switching to {width}x{height}..."
-    (text_w, text_h), _ = cv2.getTextSize(msg, FONT, 1.0, 2)
-    x = (DISPLAY_WIDTH - text_w) // 2
+def show_switching_screen(width, height):
+    # show something right away so the screen doesn't look stuck while
+    # the camera reconnects
+    blank = np.zeros((480, window_width, 3), dtype="uint8")
+    msg = "Switching to " + str(width) + "x" + str(height) + "..."
+    (text_w, text_h), _ = cv2.getTextSize(msg, font, 1.0, 2)
+    x = (window_width - text_w) // 2
     y = (480 + text_h) // 2
-    cv2.putText(placeholder, msg, (x, y), FONT, 1.0, TEXT_COLOR, 2, cv2.LINE_AA)
-    cv2.imshow("Microscope Viewer", placeholder)
-    cv2.waitKey(1)  # force the window to actually repaint right now
+    cv2.putText(blank, msg, (x, y), font, 1.0, text_color, 2, cv2.LINE_AA)
+    cv2.imshow("Microscope Viewer", blank)
+    cv2.waitKey(1)
 
 
-# Start on the "Balanced" tier
-current_res_key = ord('2')
-cap, w, h = open_camera_at(current_res_key)
+# start on resolution 2 (medium / "Balanced")
+res_choice = 2
+res_width = 1280
+res_height = 960
+res_name = "Balanced"
+
+cap = open_camera(res_width, res_height)
 
 if not cap.isOpened():
-    print("Could not open the camera. Check the USB connection and that")
-    print("no other program (e.g. Celestron's own software) is using it.")
-    raise SystemExit(1)
+    print("Could not open the camera. Check the USB cable and make sure")
+    print("no other program is using the camera already.")
+    exit()
 
-# ---------------------------------------------------------------------------
-# State that the keyboard controls below will change
-# ---------------------------------------------------------------------------
+# variables that change while the program runs
+zoom = zoom_min
+pan_x = 0.5
+pan_y = 0.5  # 0.5 and 0.5 means centered
 
-zoom = ZOOM_MIN
-pan_x, pan_y = 0.5, 0.5  # 0.5, 0.5 = centered
-
-# FPS is measured once per second, at the camera-read loop (not the display
-# loop), same approach as 3_fps_and_capture_mode.py.
 frame_count = 0
-fps_clock = time.time()
-measured_fps = 0.0
+last_fps_time = time.time()
+fps = 0.0
 
-print("Controls: q=quit  +/-=zoom  0=reset  wasd=pan  1/2/3=resolution  p=snapshot")
-print(f"Saving snapshots to: {SAVE_DIR}")
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+print("Controls: q=quit +/-=zoom 0=reset wasd=pan 1/2/3=resolution p=snapshot")
+print("Snapshots will be saved in:", save_folder)
 
 while True:
-    ok, frame = cap.read()
-    if not ok:
-        # A dropped frame is not fatal -- just skip it and try again.
+    success, frame = cap.read()
+    if not success:
+        # sometimes a frame just doesn't come through, skip it and
+        # try the next one
         continue
 
-    # --- measure FPS ---
-    frame_count += 1
+    # count frames per second
+    frame_count = frame_count + 1
     now = time.time()
-    if now - fps_clock >= 1.0:
-        measured_fps = frame_count / (now - fps_clock)
+    if now - last_fps_time >= 1.0:
+        fps = frame_count / (now - last_fps_time)
         frame_count = 0
-        fps_clock = now
+        last_fps_time = now
 
-    # --- apply zoom/pan (at full captured resolution) ---
+    # do the zoom/pan on the full size image first
     view = apply_zoom_pan(frame, zoom, pan_x, pan_y)
 
-    # `view` (full resolution) is what gets saved on snapshot -- this
-    # happens BEFORE any text is drawn, so overlays never end up baked
-    # into saved images.
-    # `displayed` (scaled to a fixed width) is only what's drawn in the window.
-    displayed = resize_to_width(view, DISPLAY_WIDTH)
+    # save snapshots use "view" before resizing, but here we make a
+    # smaller copy called "displayed" just for showing on screen, so
+    # snapshots stay full quality no matter what size the window is
+    displayed = resize_to_width(view, window_width)
 
-    res_name, _, _ = RESOLUTIONS[current_res_key]
-    status_line = f"{measured_fps:4.1f} fps   {w}x{h} ({res_name})   zoom {zoom:.1f}x"
-    draw_text_lines(displayed, [status_line], anchor="top-left")
-    draw_text_lines(displayed, CONTROLS_TEXT, anchor="bottom-left")
+    status_text = "%.1f fps   %dx%d (%s)   zoom %.1fx" % (fps, res_width, res_height, res_name, zoom)
+    put_text_top_left(displayed, status_text)
+    put_text_bottom_left(displayed, "q quit | +/- zoom | 0 reset | wasd pan | 1/2/3 resolution | p snapshot")
 
     cv2.imshow("Microscope Viewer", displayed)
 
-    # --- handle keyboard input ---
     key = cv2.waitKey(1) & 0xFF
 
     if key == ord('q'):
         break
 
-    elif key in (ord('+'), ord('=')):
-        zoom = min(ZOOM_MAX, zoom + ZOOM_STEP)
+    elif key == ord('+') or key == ord('='):
+        zoom = zoom + zoom_step
+        if zoom > zoom_max:
+            zoom = zoom_max
 
     elif key == ord('-'):
-        zoom = max(ZOOM_MIN, zoom - ZOOM_STEP)
+        zoom = zoom - zoom_step
+        if zoom < zoom_min:
+            zoom = zoom_min
 
     elif key == ord('0'):
-        zoom = ZOOM_MIN
-        pan_x, pan_y = 0.5, 0.5
+        zoom = zoom_min
+        pan_x = 0.5
+        pan_y = 0.5
 
     elif key == ord('w'):
-        pan_y = max(0.0, pan_y - PAN_STEP)
+        pan_y = pan_y - pan_step
+        if pan_y < 0.0:
+            pan_y = 0.0
 
     elif key == ord('s'):
-        pan_y = min(1.0, pan_y + PAN_STEP)
+        pan_y = pan_y + pan_step
+        if pan_y > 1.0:
+            pan_y = 1.0
 
     elif key == ord('a'):
-        pan_x = max(0.0, pan_x - PAN_STEP)
+        pan_x = pan_x - pan_step
+        if pan_x < 0.0:
+            pan_x = 0.0
 
     elif key == ord('d'):
-        pan_x = min(1.0, pan_x + PAN_STEP)
+        pan_x = pan_x + pan_step
+        if pan_x > 1.0:
+            pan_x = 1.0
 
-    elif key in RESOLUTIONS and key != current_res_key:
-        current_res_key = key
-        _, new_w, new_h = RESOLUTIONS[current_res_key]
-        show_switching_message(new_w, new_h)  # immediate feedback, before the slow part
-
-        cap.release()                       # close the old stream first
-        cap, w, h = open_camera_at(current_res_key)  # then open fresh at new size
-        # Don't let FPS numbers from the old resolution bleed into the new one
+    elif key == ord('1') and res_choice != 1:
+        res_choice = 1
+        res_width = 800
+        res_height = 600
+        res_name = "Fast"
+        show_switching_screen(res_width, res_height)
+        cap.release()
+        cap = open_camera(res_width, res_height)
         frame_count = 0
-        fps_clock = time.time()
+        last_fps_time = time.time()
+
+    elif key == ord('2') and res_choice != 2:
+        res_choice = 2
+        res_width = 1280
+        res_height = 960
+        res_name = "Balanced"
+        show_switching_screen(res_width, res_height)
+        cap.release()
+        cap = open_camera(res_width, res_height)
+        frame_count = 0
+        last_fps_time = time.time()
+
+    elif key == ord('3') and res_choice != 3:
+        res_choice = 3
+        res_width = 2048
+        res_height = 1536
+        res_name = "Max detail"
+        show_switching_screen(res_width, res_height)
+        cap.release()
+        cap = open_camera(res_width, res_height)
+        frame_count = 0
+        last_fps_time = time.time()
 
     elif key == ord('p'):
-        # Save `frame` (raw from the sensor) rather than `view` (after
-        # digital zoom/pan). Digital zoom only crops + upscales -- it adds
-        # no real detail, so baking it into the saved file would just
-        # throw away resolution permanently. Saving the raw frame instead
-        # keeps every real pixel the sensor captured; you can always crop
-        # or zoom into the saved PNG afterwards with NO quality loss
-        # compared to baking the same zoom in now.
-        filename = datetime.now().strftime("snapshot_%Y%m%d_%H%M%S.png")
-        path = os.path.join(SAVE_DIR, filename)
-        cv2.imwrite(path, frame)
-        print(f"Saved (full sensor resolution {w}x{h}):", path)
+        # save "frame" (the original, before zoom/pan) not "view",
+        # because zooming in digitally doesn't add any real detail, it
+        # just crops and stretches. Saving the original keeps all the
+        # real pixels so you can crop into it later in an editor with
+        # no quality loss.
+        now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = "snapshot_" + now_str + ".png"
+        full_path = os.path.join(save_folder, filename)
+        cv2.imwrite(full_path, frame)
+        print("Saved snapshot (full resolution " + str(res_width) + "x" + str(res_height) + "):", full_path)
 
 cap.release()
 cv2.destroyAllWindows()
